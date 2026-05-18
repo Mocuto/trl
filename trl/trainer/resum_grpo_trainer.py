@@ -2477,6 +2477,84 @@ class ReSumGRPOTrainer(_BaseTrainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
+        # ----- Debugging: tensor shape + first-call memory dump -----
+        # On the FIRST call only, dump cuda.memory_summary so we can see what's
+        # lingering from rollout state. On every call, log shapes so we can
+        # confirm pdtbs is being respected and see the total per-batch token
+        # count entering the forward pass.
+        try:
+            batch_size = int(input_ids.size(0))
+            total_input_tokens = int(input_ids.numel())
+            advantages_shape = tuple(inputs["advantages"].shape) if "advantages" in inputs else None
+            seg_groups = inputs.get("segment_groups", None)
+            num_seg = int(seg_groups.numel()) if seg_groups is not None and hasattr(seg_groups, "numel") else None
+            print(
+                f"[_compute_loss] batch={batch_size} "
+                f"prompt_shape={tuple(prompt_ids.shape)} "
+                f"completion_shape={tuple(completion_ids.shape)} "
+                f"input_ids_shape={tuple(input_ids.shape)} "
+                f"total_input_tokens={total_input_tokens:,} "
+                f"logits_to_keep={logits_to_keep} "
+                f"advantages_shape={advantages_shape} "
+                f"num_segments={num_seg}"
+            )
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "loss_input/batch_size": batch_size,
+                        "loss_input/prompt_seq_len": int(prompt_ids.size(1)),
+                        "loss_input/completion_seq_len": int(completion_ids.size(1)),
+                        "loss_input/total_tokens": total_input_tokens,
+                        "loss_input/logits_to_keep": int(logits_to_keep),
+                        "loss_input/num_segments": num_seg if num_seg is not None else -1,
+                    })
+            except Exception:
+                pass
+
+            # One-shot memory diag at the first rollout→train transition.
+            # Class-level flag prevents repeat dumps; we only need the first one
+            # to see what survived the rollout.
+            if not getattr(self.__class__, "_first_loss_memory_dumped", False):
+                self.__class__._first_loss_memory_dumped = True
+                if torch.cuda.is_available():
+                    alloc_gb = torch.cuda.memory_allocated() / 1024**3
+                    reserved_gb = torch.cuda.memory_reserved() / 1024**3
+                    max_alloc_gb = torch.cuda.max_memory_allocated() / 1024**3
+                    print(
+                        f"\n[FIRST _compute_loss memory snapshot] "
+                        f"alloc={alloc_gb:.2f}GB reserved={reserved_gb:.2f}GB "
+                        f"max_alloc_since_start={max_alloc_gb:.2f}GB\n"
+                    )
+                    print(torch.cuda.memory_summary(abbreviated=True))
+                    # Inspect trainer-held buffers that might be hanging onto rollout state.
+                    buf = getattr(self, "_buffered_inputs", None)
+                    if buf is not None:
+                        try:
+                            n = len(buf) if hasattr(buf, "__len__") else "?"
+                            print(f"[buffer] _buffered_inputs length: {n}")
+                            if n and n != "?":
+                                first = buf[0]
+                                if isinstance(first, dict):
+                                    for k, v in first.items():
+                                        if hasattr(v, "shape"):
+                                            print(f"[buffer]   {k}.shape = {tuple(v.shape)} dtype={v.dtype}")
+                        except Exception as e:
+                            print(f"[buffer] inspection failed: {e}")
+                    try:
+                        import wandb
+                        if wandb.run is not None:
+                            wandb.log({
+                                "first_loss_mem/allocated_gb": alloc_gb,
+                                "first_loss_mem/reserved_gb": reserved_gb,
+                                "first_loss_mem/max_allocated_gb": max_alloc_gb,
+                            })
+                    except Exception:
+                        pass
+        except Exception as _e:
+            print(f"[_compute_loss] diagnostic logging failed: {_e}")
+        # ----- end debugging -----
+
         # Compute the per_token_logps and the entropy at each position in the completion.
         # ReSum-GRPO: process segments one at a time to avoid OOM on large batches
         # of long segments. Standard GRPO with short completions can use the full batch.
