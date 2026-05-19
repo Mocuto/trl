@@ -1107,7 +1107,22 @@ class ReSumGRPOTrainer(_BaseTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
-        output = super().training_step(model, inputs, num_items_in_batch)
+
+        # ReSum chunked path: when the rollout produced multi-segment training
+        # entries (one trajectory → many segments, each its own training row),
+        # the batch dim is huge (e.g. 67) and a single forward+backward over
+        # the whole thing keeps every segment's autograd graph alive
+        # simultaneously → OOM. Instead, process the batch in chunks of
+        # per_device_train_batch_size: forward+(loss/num_chunks).backward()
+        # per chunk, accumulate gradients across chunks, then let the outer
+        # optimizer step happen once with the accumulated gradients.
+        # Mathematically equivalent to the full-batch path because
+        # ∇(mean of L_i) = mean of ∇L_i.
+        seg_groups = inputs.get("segment_groups") if isinstance(inputs, dict) else None
+        if seg_groups is not None and inputs["prompt_ids"].size(0) > self.args.per_device_train_batch_size:
+            output = self._chunked_training_step(model, inputs, num_items_in_batch)
+        else:
+            output = super().training_step(model, inputs, num_items_in_batch)
         self._step += 1
         time_after = time.perf_counter()
         self._current_train_step_time += time_after - time_before
@@ -1115,6 +1130,87 @@ class ReSumGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
             self._current_train_step_time = 0.0
         return output
+
+    def _chunked_training_step(self, model, inputs, num_items_in_batch):
+        """Process a multi-segment batch in chunks to bound peak GPU memory.
+
+        Each chunk does a fresh forward + backward, releasing its autograd
+        graph before the next chunk's forward. Gradients accumulate in the
+        LoRA params across chunks, exactly as if we'd called backward on
+        the full-batch loss in one shot.
+        """
+        from copy import copy as _shallow_copy
+
+        # Tensors and lists in inputs that need to be sliced along the
+        # segment (batch) dimension.
+        SLICEABLE_KEYS = (
+            "prompt_ids", "prompt_mask", "completion_ids", "completion_mask",
+            "advantages", "old_per_token_logps", "ref_per_token_logps",
+            "sampling_per_token_logps", "tool_mask",
+            "importance_sampling_ratio", "segment_groups",
+        )
+
+        N = inputs["prompt_ids"].size(0)
+        chunk_size = max(1, self.args.per_device_train_batch_size)
+        num_chunks = (N + chunk_size - 1) // chunk_size
+
+        # Match HF Trainer.training_step's pattern: it scales loss UP by
+        # gradient_accumulation_steps before backward, then returns
+        # loss.detach() / gradient_accumulation_steps. We replicate that.
+        grad_accum_steps = self.accelerator.gradient_accumulation_steps
+
+        total_scalar_loss = 0.0
+        print(f"[chunked_training_step] N={N} chunk_size={chunk_size} num_chunks={num_chunks}")
+
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, N)
+
+            # Build a sliced sub-input dict (shallow copy + replace sliced keys).
+            chunk_inputs = _shallow_copy(inputs)
+            for key in SLICEABLE_KEYS:
+                v = chunk_inputs.get(key)
+                if v is None:
+                    continue
+                if hasattr(v, "__getitem__"):
+                    chunk_inputs[key] = v[start:end]
+
+            # Forward + per-token loss on this chunk only.
+            with self.compute_loss_context_manager():
+                chunk_loss = self.compute_loss(
+                    model, chunk_inputs, num_items_in_batch=num_items_in_batch,
+                )
+
+            # Scale: each chunk contributes (chunk_size / N) of the total loss.
+            # _compute_loss already returned a chunk-mean loss, so dividing
+            # by num_chunks gives the right contribution to the full-batch
+            # mean. Then scale UP by grad_accum_steps to match HF's backward
+            # convention (it'll later normalize back down).
+            scaled = (chunk_loss / num_chunks) * grad_accum_steps
+
+            kwargs = {}
+            import inspect
+            if "num_items_in_batch" in inspect.signature(self.accelerator.backward).parameters:
+                kwargs["num_items_in_batch"] = num_items_in_batch
+            self.accelerator.backward(scaled, **kwargs)
+            total_scalar_loss += chunk_loss.detach().item()
+
+            # Drop the chunk's intermediate state before the next iteration.
+            del chunk_inputs, chunk_loss, scaled
+
+            # Release per-chunk autograd state explicitly. The accumulated
+            # gradients on parameters stay; we just want intermediate
+            # activations gone.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Mean loss across chunks, formatted to match HF's
+        # training_step return contract (already-scaled-down by grad_accum).
+        mean_loss = total_scalar_loss / num_chunks
+        return torch.tensor(
+            mean_loss / grad_accum_steps,
+            device=inputs["prompt_ids"].device if hasattr(inputs["prompt_ids"], "device") else "cpu",
+        )
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
