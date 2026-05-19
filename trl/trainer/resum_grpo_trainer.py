@@ -1282,8 +1282,13 @@ class ReSumGRPOTrainer(_BaseTrainer):
             total_scalar_loss += chunk_loss.detach().item()
 
             del chunk_inputs, chunk_loss, scaled
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Note: NOT calling torch.cuda.empty_cache() between chunks.
+            # empty_cache is sync-blocking (waits for all CUDA ops to finish)
+            # and can stall the CPU at 100% in a tight loop while the GPU
+            # finishes. With PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+            # the allocator handles fragmentation across chunks fine without
+            # explicit flushing. If you OOM partway through chunks, re-enable
+            # this line, but expect a CPU-bound stall.
 
         # Log how much padding overhead the per-chunk re-padding saved.
         if total_padding_saved_tokens > 0:
@@ -1303,9 +1308,16 @@ class ReSumGRPOTrainer(_BaseTrainer):
             except Exception:
                 pass
 
-        # Return the chunk-mean loss as a Python float; the caller wraps it
-        # into a tensor for HF's logging contract.
-        return total_scalar_loss / num_chunks / grad_accum_steps
+        # Return value math:
+        # - compute_loss returns (chunk_mean / G) where G = current_gradient_accumulation_steps
+        # - total_scalar_loss = sum over chunks of (chunk_mean / G) = (sum chunk_means) / G
+        # - HF's standard training_step returns `mean_loss / G` where mean_loss is
+        #   the full-batch loss. For us: mean_loss ≈ mean of chunk_means.
+        # - Correct return: total_scalar_loss / num_chunks  (NOT / G again — the /G
+        #   is already baked into each chunk_loss by compute_loss's normalizer).
+        chunk_mean_over_G = total_scalar_loss / num_chunks
+        print(f"[chunked_training_step] chunk_mean_loss={chunk_mean_over_G:.6f} (after /G={grad_accum_steps})")
+        return chunk_mean_over_G
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
