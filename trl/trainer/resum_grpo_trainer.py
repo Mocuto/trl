@@ -1108,6 +1108,20 @@ class ReSumGRPOTrainer(_BaseTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
 
+        # One-shot fingerprint so we can confirm the process is running this
+        # version (and which branch the condition takes). Useful when iterating
+        # on the chunked path — if you don't see this line, the running
+        # process has stale Python imports.
+        if not getattr(self.__class__, "_training_step_fingerprint_logged", False):
+            self.__class__._training_step_fingerprint_logged = True
+            seg = inputs.get("segment_groups") if isinstance(inputs, dict) else None
+            batch_n = inputs["prompt_ids"].size(0) if isinstance(inputs, dict) and "prompt_ids" in inputs else None
+            print(
+                f"[training_step v=chunked] segment_groups_present={seg is not None} "
+                f"batch_n={batch_n} pdtbs={self.args.per_device_train_batch_size} "
+                f"will_chunk={seg is not None and batch_n is not None and batch_n > self.args.per_device_train_batch_size}"
+            )
+
         # ReSum chunked path: when the rollout produced multi-segment training
         # entries (one trajectory → many segments, each its own training row),
         # the batch dim is huge (e.g. 67) and a single forward+backward over
