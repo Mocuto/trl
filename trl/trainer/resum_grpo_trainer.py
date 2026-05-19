@@ -1213,6 +1213,13 @@ class ReSumGRPOTrainer(_BaseTrainer):
 
         total_scalar_loss = 0.0
 
+        # Token-level fields that align with the COMPLETION dimension (right-padded).
+        COMPLETION_ALIGNED_KEYS = (
+            "old_per_token_logps", "ref_per_token_logps",
+            "sampling_per_token_logps", "tool_mask",
+        )
+
+        total_padding_saved_tokens = 0
         for chunk_idx in range(num_chunks):
             start = chunk_idx * chunk_size
             end = min(start + chunk_size, N)
@@ -1224,6 +1231,42 @@ class ReSumGRPOTrainer(_BaseTrainer):
                     continue
                 if hasattr(v, "__getitem__"):
                     chunk_inputs[key] = v[start:end]
+
+            # Re-pad to per-chunk max content length. The global batch pads
+            # to max(prompt_len) + max(completion_len) across ALL 67 segments,
+            # which is hugely wasteful when a chunk contains shorter
+            # trajectories. Strip the per-chunk leading-prompt-pad and
+            # trailing-completion-pad columns; the remaining attention is
+            # equivalent because the discarded columns had mask=0.
+            try:
+                cpm = chunk_inputs["prompt_mask"]
+                ccm = chunk_inputs["completion_mask"]
+                chunk_max_prompt_len = int(cpm.sum(dim=1).max().item())
+                chunk_max_completion_len = int(ccm.sum(dim=1).max().item())
+                # Guard: if the whole chunk is empty (mask all zero), keep at least 1
+                # column so downstream indexing doesn't break.
+                chunk_max_prompt_len = max(chunk_max_prompt_len, 1)
+                chunk_max_completion_len = max(chunk_max_completion_len, 1)
+
+                global_prompt_len = chunk_inputs["prompt_ids"].size(1)
+                global_completion_len = chunk_inputs["completion_ids"].size(1)
+                chunk_inputs["prompt_ids"] = chunk_inputs["prompt_ids"][:, -chunk_max_prompt_len:]
+                chunk_inputs["prompt_mask"] = chunk_inputs["prompt_mask"][:, -chunk_max_prompt_len:]
+                chunk_inputs["completion_ids"] = chunk_inputs["completion_ids"][:, :chunk_max_completion_len]
+                chunk_inputs["completion_mask"] = chunk_inputs["completion_mask"][:, :chunk_max_completion_len]
+                # Completion-aligned token-level fields shrink with completion.
+                for tk in COMPLETION_ALIGNED_KEYS:
+                    tv = chunk_inputs.get(tk)
+                    if tv is not None and hasattr(tv, "dim") and tv.dim() >= 2 and tv.size(1) >= chunk_max_completion_len:
+                        chunk_inputs[tk] = tv[:, :chunk_max_completion_len]
+
+                # Track how much padding we cut for logging
+                end_size = chunk_inputs["prompt_ids"].size(0) * (chunk_max_prompt_len + chunk_max_completion_len)
+                full_size = chunk_inputs["prompt_ids"].size(0) * (global_prompt_len + global_completion_len)
+                total_padding_saved_tokens += (full_size - end_size)
+            except Exception as _pad_e:
+                # If anything about re-padding fails, fall back to the global padding.
+                print(f"[chunked_training_step] re-pad failed (chunk {chunk_idx}): {_pad_e} — using global padding")
 
             with self.compute_loss_context_manager():
                 chunk_loss = self.compute_loss(
@@ -1241,6 +1284,24 @@ class ReSumGRPOTrainer(_BaseTrainer):
             del chunk_inputs, chunk_loss, scaled
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        # Log how much padding overhead the per-chunk re-padding saved.
+        if total_padding_saved_tokens > 0:
+            global_total = N * (inputs["prompt_ids"].size(1) + inputs["completion_ids"].size(1))
+            pct = 100.0 * total_padding_saved_tokens / max(global_total, 1)
+            print(
+                f"[chunked_training_step] padding saved: {total_padding_saved_tokens:,} tokens "
+                f"({pct:.1f}% vs global padding)"
+            )
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "chunked/padding_saved_tokens": total_padding_saved_tokens,
+                        "chunked/padding_saved_pct": pct,
+                    })
+            except Exception:
+                pass
 
         # Return the chunk-mean loss as a Python float; the caller wraps it
         # into a tensor for HF's logging contract.
