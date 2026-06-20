@@ -64,13 +64,20 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         replay_batch_trajectories: int,
         replay_generate_every: int = 1,
         replay_positive_bias_fraction: float = 0.0,
+        replay_retention: str = "fifo",
+        replay_deviant_fraction: float = 0.0,
         replay_seed: int = 0,
         terminal_reward_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
-        self._replay_buffer = ReplayBuffer(capacity=replay_buffer_size, seed=replay_seed)
+        self._replay_buffer = ReplayBuffer(
+            capacity=replay_buffer_size,
+            seed=replay_seed,
+            retention=replay_retention,
+            deviant_fraction=replay_deviant_fraction,
+        )
         self._replay_batch_trajectories = replay_batch_trajectories
         self._replay_generate_every = replay_generate_every
         self._replay_positive_bias_fraction = replay_positive_bias_fraction
@@ -90,13 +97,43 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
 
         self.rollout_func = _capturing_rollout_func
 
+        # Startup summary + reuse-factor sanity check. R = trajectories per
+        # rollout = generation_batch_size (one episode per prompt). The
+        # reuse factor B*K/R is how many times each generated trajectory is
+        # trained on, on average — the whole point of replay.
+        R = self.args.generation_batch_size
+        B = replay_batch_trajectories
+        K = replay_generate_every
+        reuse = (B * K / R) if R else float("nan")
         print(
-            f"[ReplayGRPOTrainer] buffer_size={replay_buffer_size} "
-            f"batch_trajectories={replay_batch_trajectories} "
-            f"generate_every={replay_generate_every} "
-            f"positive_bias={replay_positive_bias_fraction} "
-            f"terminal_reward_weight={terminal_reward_weight}"
+            f"[ReplayGRPOTrainer] buffer_size(N)={replay_buffer_size} "
+            f"sample/step(B)={B} generate_every(K)={K} "
+            f"trajectories/rollout(R=generation_batch_size)={R}\n"
+            f"[ReplayGRPOTrainer] retention={replay_retention} "
+            f"deviant_fraction={replay_deviant_fraction} "
+            f"sample_positive_bias={replay_positive_bias_fraction} "
+            f"terminal_reward_weight={terminal_reward_weight}\n"
+            f"[ReplayGRPOTrainer] => reuse_factor (B*K/R) = {reuse:.2f}  "
+            f"(each generated trajectory trained on ~{reuse:.1f}x); "
+            f"every {K} steps generates {R}, samples {B}/step"
         )
+        if R and reuse < 1.0:
+            print(
+                f"[ReplayGRPOTrainer] WARNING: reuse_factor {reuse:.2f} < 1 — you "
+                f"generate more trajectories per cycle ({R}) than you consume "
+                f"({B}*{K}={B*K}); some generated trajectories will be evicted "
+                f"before ever being sampled (wasted generation). Raise "
+                f"--replay-batch-trajectories or --replay-generate-every, or "
+                f"lower the generation batch."
+            )
+        if R and replay_buffer_size < 2 * R:
+            print(
+                f"[ReplayGRPOTrainer] WARNING: buffer_size {replay_buffer_size} < 2*R "
+                f"({2 * R}) — the buffer barely spans one rollout, so uniform "
+                f"sampling is ~subsampling the latest rollout (little staleness "
+                f"diversity). Raise --replay-buffer-size to several multiples of "
+                f"R ({R}) for real replay."
+            )
 
     def _prepare_inputs(self, generation_batch):
         # Eval is unchanged — defer entirely to the base on-policy path.
@@ -210,6 +247,12 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         self._metrics[mode]["replay/buffer_fill_fraction"].append(float(stats.get("fill_fraction", 0.0)))
         self._metrics[mode]["replay/buffer_staleness_mean"].append(float(stats.get("staleness_mean", 0.0)))
         self._metrics[mode]["replay/buffer_staleness_max"].append(float(stats.get("staleness_max", 0.0)))
+        # buffer_reward_std is the headline signal for retention policy: with
+        # "deviance" it should stay healthily nonzero even as the policy
+        # improves and fresh-batch reward variance collapses. If it decays
+        # toward 0 like fifo, the std-collapse crash risk returns.
+        self._metrics[mode]["replay/buffer_reward_mean"].append(float(stats.get("reward_mean", 0.0)))
+        self._metrics[mode]["replay/buffer_reward_std"].append(float(stats.get("reward_std", 0.0)))
         if staleness:
             self._metrics[mode]["replay/sample_staleness_mean"].append(sum(staleness) / len(staleness))
             self._metrics[mode]["replay/sample_staleness_max"].append(float(max(staleness)))

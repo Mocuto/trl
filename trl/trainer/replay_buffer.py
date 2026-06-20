@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import math
 import random
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -62,25 +61,117 @@ class TrajectoryRecord:
 
 
 class ReplayBuffer:
-    """FIFO buffer of TrajectoryRecords with uniform / positive-bias sampling."""
+    """Replay buffer of TrajectoryRecords with pluggable retention + sampling.
 
-    def __init__(self, capacity: int, seed: int = 0):
+    Retention (which records survive when over capacity) — three variants,
+    all A/B-comparable:
+      - "fifo": keep the N freshest, drop the oldest. Simple, but as the
+        policy improves the buffer fills with uniformly-good (low-variance)
+        trajectories → GRPO advantage std collapses → the success-streak
+        crash. This is the failure mode the paper and our runs observe.
+      - "deviance": keep the freshest (1-δ)N PLUS the δN MOST-DEVIANT of
+        the remaining (older) trajectories, where deviance = |reward -
+        buffer_mean_reward|. Deliberately retains the reward extremes
+        (both tails) to keep buffer variance alive even when fresh
+        generations have collapsed to uniform success, keeping advantage
+        normalization well-conditioned. Tradeoff: retained deviant
+        trajectories are typically OLDER → more policy drift; watch
+        replay/buffer_staleness_max + the IS-ratio / clip metrics.
+      - "positive": the paper's variant — keep the freshest (1-δ)N PLUS
+        the δN HIGHEST-REWARD of the remainder. Likely overlaps the recent
+        set heavily as the policy improves (recent ≈ best), so adds less
+        variance than "deviance", but stays closer to on-policy (less
+        drift). Kept so we can compare it head-to-head against deviance.
+
+    The δ knob is `deviant_fraction` for both "deviance" and "positive".
+
+    Sampling (which records a training minibatch draws) is independent:
+    uniform or positive-bias, controlled per sample() call.
+    """
+
+    _RETENTION_MODES = ("fifo", "deviance", "positive")
+
+    def __init__(
+        self,
+        capacity: int,
+        seed: int = 0,
+        retention: str = "fifo",
+        deviant_fraction: float = 0.0,
+    ):
         if capacity <= 0:
             raise ValueError(f"ReplayBuffer capacity must be > 0, got {capacity}")
+        if retention not in self._RETENTION_MODES:
+            raise ValueError(
+                f"retention must be one of {self._RETENTION_MODES}, got {retention!r}"
+            )
+        if not (0.0 <= deviant_fraction < 1.0):
+            raise ValueError(f"deviant_fraction must be in [0, 1), got {deviant_fraction}")
         self.capacity = capacity
-        self._buf: deque[TrajectoryRecord] = deque(maxlen=capacity)
+        self.retention = retention
+        self.deviant_fraction = deviant_fraction
+        # Plain list, ordered oldest -> newest. We prune explicitly rather
+        # than relying on deque(maxlen) so retention can be non-FIFO.
+        self._buf: List[TrajectoryRecord] = []
         self._rng = random.Random(seed)
 
     def __len__(self) -> int:
         return len(self._buf)
 
     def add(self, record: TrajectoryRecord) -> None:
-        # deque(maxlen) evicts the oldest automatically — FIFO.
         self._buf.append(record)
+        self._prune()
 
     def extend(self, records: List[TrajectoryRecord]) -> None:
-        for r in records:
-            self.add(r)
+        self._buf.extend(records)
+        self._prune()
+
+    def _prune(self) -> None:
+        """Drop records down to capacity using the configured retention policy."""
+        if len(self._buf) <= self.capacity:
+            return
+        if self.retention in ("deviance", "positive") and self.deviant_fraction > 0.0:
+            self._buf = self._prune_freshest_plus_scored()
+        else:
+            # FIFO (or deviance/positive with δ=0): keep the N freshest.
+            self._buf = self._buf[-self.capacity:]
+
+    def _prune_freshest_plus_scored(self) -> List[TrajectoryRecord]:
+        """Keep freshest (1-δ)N + the top-δN of the remainder by a score.
+
+        Score depends on retention mode:
+          - "deviance": |reward - buffer_mean| (retains reward extremes →
+            preserves variance)
+          - "positive": reward (retains highest-reward older trajectories,
+            the paper's variant)
+
+        Insertion order is preserved in the result so future prunes still
+        see correct freshness ordering.
+        """
+        n = self.capacity
+        n_extra = round(self.deviant_fraction * n)
+        n_fresh = n - n_extra
+        if n_fresh <= 0:  # degenerate; shouldn't happen since δ < 1
+            n_fresh = 1
+            n_extra = n - 1
+
+        fresh = self._buf[-n_fresh:]
+        older = self._buf[:-n_fresh]
+        if n_extra <= 0 or not older:
+            return self._buf[-n:]
+
+        if self.retention == "deviance":
+            rewards = [r.reward for r in self._buf]
+            mean = sum(rewards) / len(rewards)
+            key = lambda r: abs(r.reward - mean)
+        else:  # "positive"
+            key = lambda r: r.reward
+
+        older_ranked = sorted(older, key=key, reverse=True)
+        extra = older_ranked[:n_extra]
+
+        retained = {id(x) for x in fresh} | {id(x) for x in extra}
+        # Preserve oldest->newest order among retained records.
+        return [x for x in self._buf if id(x) in retained]
 
     def sample(
         self,
