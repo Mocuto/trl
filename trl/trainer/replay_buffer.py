@@ -239,6 +239,8 @@ class ReplayBuffer:
             "staleness_max": max(ages),
             "reward_mean": sum(rewards) / len(rewards),
             "reward_std": _sample_std(rewards),
+            "reward_min": min(rewards),
+            "reward_max": max(rewards),
         }
 
 

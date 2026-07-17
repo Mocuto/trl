@@ -285,6 +285,11 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         # toward 0 like fifo, the std-collapse crash risk returns.
         self._metrics[mode]["replay/buffer_reward_mean"].append(float(stats.get("reward_mean", 0.0)))
         self._metrics[mode]["replay/buffer_reward_std"].append(float(stats.get("reward_std", 0.0)))
+        # min/max expose the buffer's reward spread directly — e.g. whether
+        # deviance retention is pinning a stale very-negative trajectory that
+        # drags buffer_reward_mean below live rollout performance.
+        self._metrics[mode]["replay/buffer_reward_min"].append(float(stats.get("reward_min", 0.0)))
+        self._metrics[mode]["replay/buffer_reward_max"].append(float(stats.get("reward_max", 0.0)))
         if staleness:
             self._metrics[mode]["replay/sample_staleness_mean"].append(sum(staleness) / len(staleness))
             self._metrics[mode]["replay/sample_staleness_max"].append(float(max(staleness)))
