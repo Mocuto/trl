@@ -11,12 +11,14 @@ Everything else — the loss, the chunked training_step, generation, reward
 funcs, logging — is inherited unchanged. The base on-policy ReSum path is
 never modified; if you don't instantiate this class, nothing here runs.
 
-Off-policy correction: stored generation-time logprobs are used directly as
-old_per_token_logps (the "use the old probabilities" choice). The IS ratio
-in the loss then measures full policy drift since generation, which we
-instrument via replay/* metrics. If that drift drives instability, the
-follow-ups are recompute-under-current-policy, AsymRE, or ReVal-style
-logit-as-Q recomputation — all deliberately out of scope here.
+Off-policy correction: old_per_token_logps can either be recomputed under the
+current policy (default) or read from the stored generation-time logprobs.
+Recomputing takes a fresh PPO snapshot at the start of each update, so the IS
+ratio starts at ~1 and only diverges across the inner GRPO iterations — the
+same behavior as on-policy GRPO. Using stored logprobs instead makes the ratio
+measure the *full* policy drift since generation, which inflates the clip
+fraction as buffer staleness grows. Toggle via `replay_recompute_old_logprobs`;
+both paths are instrumented via replay/* metrics.
 
 Pure buffer logic lives in replay_buffer.py (framework-agnostic, unit-tested).
 """
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import torch
 
+from ..models.utils import disable_gradient_checkpointing
 from .resum_grpo_trainer import ReSumGRPOTrainer
 from .utils import pad
 from .replay_buffer import (
@@ -49,6 +52,11 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         replay_positive_bias_fraction (`float`, *optional*, defaults to `0.0`):
             Fraction of each sampled minibatch drawn from highest-reward
             trajectories (the paper's positive-bias sampling). 0 → uniform.
+        replay_recompute_old_logprobs (`bool`, *optional*, defaults to `True`):
+            If `True`, recompute `old_per_token_logps` under the current policy
+            for each sampled minibatch (fresh PPO snapshot; IS ratio starts at
+            ~1). If `False`, use the stored generation-time logprobs, so the IS
+            ratio measures full policy drift since generation.
         replay_seed (`int`, *optional*, defaults to `0`):
             Seed for the buffer's sampling RNG.
         terminal_reward_weight (`float`, *optional*, defaults to `1.0`):
@@ -66,6 +74,7 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         replay_positive_bias_fraction: float = 0.0,
         replay_retention: str = "fifo",
         replay_deviant_fraction: float = 0.0,
+        replay_recompute_old_logprobs: bool = True,
         replay_seed: int = 0,
         terminal_reward_weight: float = 1.0,
         **kwargs,
@@ -81,6 +90,7 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         self._replay_batch_trajectories = replay_batch_trajectories
         self._replay_generate_every = replay_generate_every
         self._replay_positive_bias_fraction = replay_positive_bias_fraction
+        self._replay_recompute_old_logprobs = replay_recompute_old_logprobs
         self._replay_terminal_reward_weight = terminal_reward_weight
 
         # Wrap rollout_func to capture its raw output. The base calls
@@ -211,14 +221,36 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
             pad_to_multiple_of=self.pad_to_multiple_of,
         ).to(device)
 
-        # Generation-time logprobs become old_per_token_logps (right-padded,
-        # aligned with completion_ids). len(logprobs)==len(completion_ids)
-        # per segment (one logprob per completion token).
-        old_logps = [torch.tensor(lp, dtype=torch.float32) for lp in flat["old_logprobs"]]
-        old_per_token_logps = pad(
-            old_logps, padding_value=0.0, padding_side="right",
-            pad_to_multiple_of=self.pad_to_multiple_of,
-        ).to(device)
+        # old_per_token_logps: either recomputed under the current policy (a
+        # fresh PPO snapshot, so the IS ratio starts at ~1 and only diverges
+        # across the inner GRPO iterations) or read from the stored
+        # generation-time logprobs (ratio measures full drift since generation,
+        # which inflates the clip fraction as buffer staleness grows).
+        if self._replay_recompute_old_logprobs:
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep = completion_ids.size(1)
+            # Mirrors the base GRPOTrainer's old_per_token_logps computation:
+            # no_grad + checkpointing disabled (avoids the requires_grad warning).
+            with torch.no_grad(), disable_gradient_checkpointing(
+                self.model, self.args.gradient_checkpointing_kwargs
+            ):
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size=self.args.per_device_train_batch_size,
+                )
+        else:
+            # Generation-time logprobs become old_per_token_logps (right-padded,
+            # aligned with completion_ids). len(logprobs)==len(completion_ids)
+            # per segment (one logprob per completion token).
+            old_logps = [torch.tensor(lp, dtype=torch.float32) for lp in flat["old_logprobs"]]
+            old_per_token_logps = pad(
+                old_logps, padding_value=0.0, padding_side="right",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device)
 
         advantages = torch.tensor(flat["advantages"], dtype=torch.float32, device=device)
         segment_groups = torch.tensor(flat["segment_groups"], dtype=torch.long, device=device)
