@@ -53,10 +53,15 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
             Fraction of each sampled minibatch drawn from highest-reward
             trajectories (the paper's positive-bias sampling). 0 → uniform.
         replay_recompute_old_logprobs (`bool`, *optional*, defaults to `True`):
-            If `True`, recompute `old_per_token_logps` under the current policy
-            for each sampled minibatch (fresh PPO snapshot; IS ratio starts at
-            ~1). If `False`, use the stored generation-time logprobs, so the IS
-            ratio measures full policy drift since generation.
+            If `True`, take a fresh current-policy snapshot for
+            `old_per_token_logps` so the IS ratio starts at ~1 (rather than
+            measuring full policy drift since generation, as the stored
+            generation-time logprobs would). The snapshot only requires an extra
+            forward pass when `num_iterations > 1` (the sample is reused and the
+            snapshot must be fixed); at `num_iterations == 1` it is left `None`
+            and the loss uses `per_token_logps.detach()`, which is identical
+            (ratio == 1) with no extra forward. If `False`, use the stored
+            generation-time logprobs.
         replay_seed (`int`, *optional*, defaults to `0`):
             Seed for the buffer's sampling RNG.
         terminal_reward_weight (`float`, *optional*, defaults to `1.0`):
@@ -226,7 +231,16 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
         # across the inner GRPO iterations) or read from the stored
         # generation-time logprobs (ratio measures full drift since generation,
         # which inflates the clip fraction as buffer staleness grows).
-        if self._replay_recompute_old_logprobs:
+        if self._replay_recompute_old_logprobs and self.num_iterations > 1:
+            # Only recompute when the sampled minibatch is reused across inner
+            # iterations (num_iterations > 1) and therefore needs a FIXED old
+            # snapshot. At num_iterations == 1 the sample is used exactly once, so
+            # leaving old_per_token_logps=None lets the loss use
+            # per_token_logps.detach() — an identical ratio (=1) with NO extra
+            # forward. Recomputing there would add a full-vocab logits allocation
+            # (pdtbs x completion_len x vocab) per step that fragments the
+            # allocator and OOMs on long sampled segments. Mirrors the base
+            # trainer, which likewise skips old_per_token_logps when aligned.
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
             logits_to_keep = completion_ids.size(1)
@@ -242,6 +256,10 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
                     logits_to_keep,
                     batch_size=self.args.per_device_train_batch_size,
                 )
+        elif self._replay_recompute_old_logprobs:
+            # num_iterations == 1: no snapshot needed; loss uses detached current
+            # logps (ratio == 1), which is what recompute would yield anyway.
+            old_per_token_logps = None
         else:
             # Generation-time logprobs become old_per_token_logps (right-padded,
             # aligned with completion_ids). len(logprobs)==len(completion_ids)
