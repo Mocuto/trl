@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import torch
 
+from ..extras.profiling import profiling_decorator
 from ..models.utils import disable_gradient_checkpointing
 from .resum_grpo_trainer import ReSumGRPOTrainer
 from .utils import pad
@@ -150,6 +151,7 @@ class ReplayGRPOTrainer(ReSumGRPOTrainer):
                 f"R ({R}) for real replay."
             )
 
+    @profiling_decorator
     def _prepare_inputs(self, generation_batch):
         # Eval is unchanged — defer entirely to the base on-policy path.
         mode = "train" if self.model.training else "eval"
